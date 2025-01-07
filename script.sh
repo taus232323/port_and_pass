@@ -27,7 +27,7 @@ sed -i "s/^PasswordAuthentication yes/PasswordAuthentication no/" /etc/ssh/sshd_
 
 # Перезапуск службы SSH
 echo "Перезапуск службы SSH..."
-systemctl restart sshd
+systemctl restart ssh
 
 # Вывод информации
 echo "Порт SSH успешно изменен на $NEW_PORT."
