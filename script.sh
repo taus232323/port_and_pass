@@ -22,6 +22,7 @@ if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
 elif [ "$USER" != "root" ]; then
     TARGET_USER="$USER"
 else
+    # Ищем первого обычного пользователя (UID >= 1000, кроме nobody)
     TARGET_USER=$(getent passwd {1000..65535} | awk -F: '($3 >= 1000) && ($3 != 65534) {print $1; exit}')
 fi
 
@@ -38,19 +39,39 @@ if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt
     exit 1
 fi
 
-# Удаляем старые Port и добавляем новый
+# Удаляем все строки с Port и добавляем новую
 sed -i '/^[[:space:]]*Port[[:space:]]\+/d' /etc/ssh/sshd_config
 echo "Port $NEW_PORT" >> /etc/ssh/sshd_config
 
-# Отключаем пароли, если есть ключи
-if [ -s /root/.ssh/authorized_keys ] || ls /home/*/\.ssh/authorized_keys 2>/dev/null | grep -q .; then
+# Проверяем наличие хотя бы одного authorized_keys
+SSH_KEYS_FOUND=false
+if [ -s /root/.ssh/authorized_keys ]; then
+    SSH_KEYS_FOUND=true
+else
+    while IFS= read -r -d '' dir; do
+        if [ -s "$dir" ]; then
+            SSH_KEYS_FOUND=true
+            break
+        fi
+    done < <(find /home -maxdepth 2 -name "authorized_keys" -type f -print0 2>/dev/null)
+fi
+
+if [ "$SSH_KEYS_FOUND" = true ]; then
     sed -i 's/^[[:space:]]*#*[[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
     echo "🔒 Вход по паролю отключён."
 else
-    echo "⚠️  Вход по паролю оставлен — нет SSH-ключей."
+    echo "⚠️  Вход по паролю оставлен — не найдено SSH-ключей."
 fi
 
-# Проверка конфига перед перезапуском
+# ───────────────────────────────────────────────────────────────
+# 🔧 Создаём /run/sshd если его нет (для sshd -t)
+# ───────────────────────────────────────────────────────────────
+if [ ! -d /run/sshd ]; then
+    mkdir -p /run/sshd
+    chmod 755 /run/sshd
+fi
+
+# Проверка конфигурации
 if ! sshd -t; then
     echo "❌ Конфиг SSH недействителен. Исправьте вручную:"
     echo "   sudo nano /etc/ssh/sshd_config"
@@ -58,6 +79,7 @@ if ! sshd -t; then
     exit 1
 fi
 
+# Перезапуск SSH
 systemctl restart ssh
 if ! systemctl is-active --quiet ssh; then
     echo "❌ SSH не запущен. Проверьте: systemctl status ssh"
@@ -105,14 +127,11 @@ install_docker() {
 
     apt install -y -qq ca-certificates curl gnupg lsb-release >/dev/null
 
-    # GPG-ключ (из knowledge base: /gpg существует)
     echo "🔑 Добавление GPG-ключа Docker..."
     install -m 0755 -d /etc/apt/keyrings
-    # Убираем лишний пробел из URL (была ошибка в оригинале!)
-    curl -fsSL "https://download.docker.com/linux/ubuntu/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     chmod a+r /etc/apt/keyrings/docker.gpg
 
-    # Репозиторий
     CODENAME=$(lsb_release -cs 2>/dev/null || { . /etc/os-release; echo "${VERSION_CODENAME:-jammy}"; })
     ARCH=$(dpkg --print-architecture)
     echo "deb [arch=$ARCH signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $CODENAME stable" \
@@ -128,7 +147,6 @@ install_docker() {
         docker-compose-plugin \
         >/dev/null
 
-    # Проверка
     docker --version >/dev/null || { echo "❌ Docker не установлен."; exit 1; }
     docker compose version >/dev/null || { echo "❌ docker compose недоступен."; exit 1; }
     echo "✅ Docker и docker compose установлены."
@@ -148,10 +166,8 @@ setup_docker_compose_compat() {
     if [ -n "$COMPOSE_BIN" ]; then
         ln -sf "$COMPOSE_BIN" /usr/local/bin/docker-compose 2>/dev/null || true
     else
-        # Fallback: standalone (редко)
         VER=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
         [ -z "$VER" ] && VER="v2.29.7"
-        # Убираем лишний пробел в URL (было: `.../download/  $VER/...`)
         DOWNLOAD_URL="https://github.com/docker/compose/releases/download/$VER/docker-compose-$(uname -s)-$(uname -m)"
         echo "📥 Загрузка standalone docker-compose: $DOWNLOAD_URL"
         curl -SL "$DOWNLOAD_URL" -o /usr/local/bin/docker-compose
@@ -169,10 +185,9 @@ if [ "$INSTALL_DOCKER" = true ]; then
     install_docker
     setup_docker_compose_compat
 
-    # ───── Добавление пользователя в группу docker ─────
     echo "👥 [4/5] Настройка прав доступа..."
-    if [ -n "$TARGET_USER" ] && id "$TARGET_USER" >/dev/null 2>&1; then
-        if ! groups "$TARGET_USER" | grep -q '\bdocker\b'; then
+    if [ -n "$TARGET_USER" ] && id "$TARGET_USER" &>/dev/null; then
+        if ! groups "$TARGET_USER" | grep -qw docker; then
             usermod -aG docker "$TARGET_USER"
             echo "✅ $TARGET_USER добавлен в группу 'docker'."
             echo "ℹ️  Примените изменения: 'newgrp docker' или перелогиньтесь."
@@ -197,7 +212,7 @@ echo "Доступно обновлений: $UPGRADABLE"
 
 if [ "$UPGRADABLE" -gt 0 ]; then
     echo
-    read -p "Выполнить 'apt upgrade' (может занять время)? [Y/n]: " -r REPLY
+    read -p "Выполнить 'apt upgrade'? [Y/n]: " -r REPLY
     case "${REPLY:-Y}" in
         [yY]|[Yy][eE][sS]|"")
             echo
