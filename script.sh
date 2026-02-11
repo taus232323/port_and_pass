@@ -63,7 +63,25 @@ if ! systemctl is-active --quiet ssh; then
     echo "❌ SSH не запущен. Проверьте: systemctl status ssh"
     exit 1
 fi
-echo "✅ SSH настроен на порт $NEW_PORT."
+
+# ───────────────────────────────────────────────────────────────
+# 🔍 Дополнительная проверка: порт и PasswordAuthentication
+# ───────────────────────────────────────────────────────────────
+ACTUAL_PORT=$(sshd -T | grep -i '^port ' | awk '{print $2}')
+if [ "$ACTUAL_PORT" != "$NEW_PORT" ]; then
+    echo "⚠️  Внимание: SSH использует порт $ACTUAL_PORT, а не $NEW_PORT."
+else
+    echo "✅ Порт SSH подтверждён: $ACTUAL_PORT"
+fi
+
+PASSWORD_AUTH=$(sshd -T | grep -i '^passwordauthentication ' | awk '{print $2}')
+if [ "$PASSWORD_AUTH" = "no" ]; then
+    echo "✅ Вход по паролю отключён (PasswordAuthentication no)."
+elif [ "$PASSWORD_AUTH" = "yes" ]; then
+    echo "⚠️  Вход по паролю ВКЛЮЧЁН (PasswordAuthentication yes)."
+else
+    echo "❓ Статус PasswordAuthentication не определён: '$PASSWORD_AUTH'"
+fi
 
 # ───────────────────────────────────────────────────────────────
 # 3. Установка Docker? — выбор пользователя
