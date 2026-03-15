@@ -117,13 +117,15 @@ EOF
         die "SSH не запущен. Проверьте: systemctl status ssh --no-pager -l"
     fi
 
-    local actual_port
-    actual_port="$(sshd -T | awk '/^port / {print $2; exit}')"
-
-    if [[ "$actual_port" == "$new_port" ]]; then
-        log "✅ sshd подтвердил порт: $actual_port"
+    local actual_port=""
+    if actual_port="$(sshd -T 2>/dev/null | sed -n 's/^port //p' | head -n1)" && [[ -n "$actual_port" ]]; then
+        if [[ "$actual_port" == "$new_port" ]]; then
+            log "✅ sshd подтвердил порт: $actual_port"
+        else
+            warn "sshd сообщает порт '$actual_port', ожидался '$new_port'"
+        fi
     else
-        warn "sshd сообщает порт '$actual_port', ожидался '$new_port'"
+        warn "Не удалось получить effective port через 'sshd -T'. Пропускаю эту проверку."
     fi
 
     if ss -tlnp | grep -qE "LISTEN.+:${new_port}\b"; then
