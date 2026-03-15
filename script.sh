@@ -1,262 +1,324 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# ───────────────────────────────────────────────────────────────
-# 🚀 Быстрая настройка сервера: SSH → (опц. Docker) → Обновление
-# ───────────────────────────────────────────────────────────────
+# ============================================================
+# Быстрая первичная настройка Ubuntu-сервера
+# - смена SSH порта
+# - отключение входа по паролю, если есть root SSH key
+# - корректный reload/restart для ssh + ssh.socket
+# - опциональная установка Docker из official Docker repo
+# - опциональное обновление системы
+#
+# Сценарий: простой сервер, вход под root
+# ============================================================
 
-set -e  # Exit on any unhandled error
+set -Eeuo pipefail
 
-if [ "$EUID" -ne 0 ]; then
-    echo "❌ Запустите как root или через sudo: sudo $0"
-    exit 1
-fi
+trap 'echo "❌ Ошибка на строке $LINENO: $BASH_COMMAND" >&2' ERR
 
-echo "🚀 Начало настройки (быстрые операции в первую очередь)..."
+SCRIPT_NAME="$(basename "$0")"
+SSH_DROPIN_DIR="/etc/ssh/sshd_config.d"
+SSH_PORT_FILE="$SSH_DROPIN_DIR/99-custom-port.conf"
+SSH_AUTH_FILE="$SSH_DROPIN_DIR/99-root-auth.conf"
 
-# ───────────────────────────────────────────────────────────────
-# 1. Определение целевого пользователя (для docker-группы)
-# ───────────────────────────────────────────────────────────────
-TARGET_USER=""
-if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-    TARGET_USER="$SUDO_USER"
-elif [ "$USER" != "root" ]; then
-    TARGET_USER="$USER"
-else
-    # Ищем первого обычного пользователя (UID >= 1000, кроме nobody)
-    TARGET_USER=$(getent passwd {1000..65535} | awk -F: '($3 >= 1000) && ($3 != 65534) {print $1; exit}')
-fi
+log()  { echo -e "$*"; }
+die()  { echo -e "❌ $*" >&2; exit 1; }
+warn() { echo -e "⚠️  $*"; }
 
-# ───────────────────────────────────────────────────────────────
-# 2. Настройка SSH (делаем сразу и критически!)
-# ───────────────────────────────────────────────────────────────
-echo "🔧 [1/5] Настройка SSH..."
+require_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        die "Запустите как root или через sudo: sudo ./$SCRIPT_NAME"
+    fi
+}
 
-read -p "Введите новый порт SSH (по умолчанию 2222): " -r NEW_PORT
-NEW_PORT="${NEW_PORT:-2222}"
+check_os() {
+    if [[ ! -f /etc/os-release ]]; then
+        die "Не найден /etc/os-release"
+    fi
 
-if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
-    echo "❌ Неверный порт: '$NEW_PORT'"
-    exit 1
-fi
+    . /etc/os-release
 
-# Удаляем все строки с Port и добавляем новую
-sed -i '/^[[:space:]]*Port[[:space:]]\+/d' /etc/ssh/sshd_config
-echo "Port $NEW_PORT" >> /etc/ssh/sshd_config
+    if [[ "${ID:-}" != "ubuntu" ]]; then
+        die "Скрипт рассчитан на Ubuntu. Обнаружено: ${PRETTY_NAME:-unknown}"
+    fi
 
-# Проверяем наличие хотя бы одного authorized_keys
-SSH_KEYS_FOUND=false
-if [ -s /root/.ssh/authorized_keys ]; then
-    SSH_KEYS_FOUND=true
-else
-    while IFS= read -r -d '' dir; do
-        if [ -s "$dir" ]; then
-            SSH_KEYS_FOUND=true
-            break
-        fi
-    done < <(find /home -maxdepth 2 -name "authorized_keys" -type f -print0 2>/dev/null)
-fi
+    UBUNTU_CODENAME_RESOLVED="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+    [[ -n "$UBUNTU_CODENAME_RESOLVED" ]] || die "Не удалось определить codename Ubuntu"
+}
 
-if [ "$SSH_KEYS_FOUND" = true ]; then
-    sed -i 's/^[[:space:]]*#*[[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-    echo "🔒 Вход по паролю отключён."
-else
-    echo "⚠️  Вход по паролю оставлен — не найдено SSH-ключей."
-fi
+ensure_packages() {
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq ca-certificates curl gnupg iproute2 lsb-release >/dev/null
+}
 
-# ───────────────────────────────────────────────────────────────
-# 🔧 Создаём /run/sshd если его нет (для sshd -t)
-# ───────────────────────────────────────────────────────────────
-if [ ! -d /run/sshd ]; then
+has_root_authorized_keys() {
+    [[ -s /root/.ssh/authorized_keys ]]
+}
+
+backup_file_if_exists() {
+    local file="$1"
+    if [[ -f "$file" ]]; then
+        cp -a "$file" "${file}.bak.$(date +%F-%H%M%S)"
+    fi
+}
+
+configure_ssh() {
+    log "🔧 [1/4] Настройка SSH..."
+
+    local new_port
+    read -r -p "Введите новый порт SSH (по умолчанию 2222): " new_port
+    new_port="${new_port:-2222}"
+
+    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
+        die "Неверный порт: '$new_port'"
+    fi
+
+    mkdir -p "$SSH_DROPIN_DIR"
+    chmod 755 "$SSH_DROPIN_DIR"
+
+    backup_file_if_exists "$SSH_PORT_FILE"
+    backup_file_if_exists "$SSH_AUTH_FILE"
+
+    cat > "$SSH_PORT_FILE" <<EOF
+Port $new_port
+EOF
+
+    if has_root_authorized_keys; then
+        cat > "$SSH_AUTH_FILE" <<'EOF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin prohibit-password
+EOF
+        log "🔒 Для root найден SSH key — вход по паролю отключён."
+    else
+        rm -f "$SSH_AUTH_FILE"
+        warn "У root не найден /root/.ssh/authorized_keys — вход по паролю оставлен."
+    fi
+
     mkdir -p /run/sshd
     chmod 755 /run/sshd
-fi
 
-# Проверка конфигурации
-if ! sshd -t; then
-    echo "❌ Конфиг SSH недействителен. Исправьте вручную:"
-    echo "   sudo nano /etc/ssh/sshd_config"
-    echo "   sudo sshd -t"
-    exit 1
-fi
+    if ! sshd -t; then
+        die "Конфиг SSH недействителен. Проверьте вручную: sshd -t"
+    fi
 
-# Перезапуск SSH
-systemctl restart ssh
-if ! systemctl is-active --quiet ssh; then
-    echo "❌ SSH не запущен. Проверьте: systemctl status ssh"
-    exit 1
-fi
+    # На новых Ubuntu ssh может работать через socket activation.
+    systemctl daemon-reload || true
 
-# ───────────────────────────────────────────────────────────────
-# 🔍 Дополнительная проверка: порт и PasswordAuthentication
-# ───────────────────────────────────────────────────────────────
-ACTUAL_PORT=$(sshd -T | grep -i '^port ' | awk '{print $2}')
-if [ "$ACTUAL_PORT" != "$NEW_PORT" ]; then
-    echo "⚠️  Внимание: SSH использует порт $ACTUAL_PORT, а не $NEW_PORT."
-else
-    echo "✅ Порт SSH подтверждён: $ACTUAL_PORT"
-fi
+    if systemctl list-unit-files | grep -q '^ssh.socket'; then
+        systemctl restart ssh.socket || true
+    fi
 
-PASSWORD_AUTH=$(sshd -T | grep -i '^passwordauthentication ' | awk '{print $2}')
-if [ "$PASSWORD_AUTH" = "no" ]; then
-    echo "✅ Вход по паролю отключён (PasswordAuthentication no)."
-elif [ "$PASSWORD_AUTH" = "yes" ]; then
-    echo "⚠️  Вход по паролю ВКЛЮЧЁН (PasswordAuthentication yes)."
-else
-    echo "❓ Статус PasswordAuthentication не определён: '$PASSWORD_AUTH'"
-fi
+    systemctl restart ssh
 
-# ───────────────────────────────────────────────────────────────
-# 3. Установка Docker? — выбор пользователя
-# ───────────────────────────────────────────────────────────────
-echo
-read -p "Установить Docker и docker compose? [Y/n]: " -r DOCKER_CHOICE
-case "${DOCKER_CHOICE:-Y}" in
-    [yY]|[Yy][eE][sS]|"")
-        INSTALL_DOCKER=true
-        ;;
-    *)
-        INSTALL_DOCKER=false
-        ;;
-esac
+    if ! systemctl is-active --quiet ssh; then
+        die "SSH не запущен. Проверьте: systemctl status ssh --no-pager -l"
+    fi
 
-# ───────────────────────────────────────────────────────────────
-# Функция: установка Docker
-# ───────────────────────────────────────────────────────────────
+    local actual_port
+    actual_port="$(sshd -T | awk '/^port / {print $2; exit}')"
+
+    if [[ "$actual_port" == "$new_port" ]]; then
+        log "✅ sshd подтвердил порт: $actual_port"
+    else
+        warn "sshd сообщает порт '$actual_port', ожидался '$new_port'"
+    fi
+
+    if ss -tlnp | grep -qE "LISTEN.+:${new_port}\b"; then
+        log "✅ Порт реально слушается: $new_port"
+    else
+        warn "Не вижу слушающий порт $new_port через ss. Проверьте:"
+        warn "systemctl status ssh --no-pager -l"
+        warn "systemctl status ssh.socket --no-pager -l"
+    fi
+
+    SSH_NEW_PORT="$new_port"
+}
+
+ask_install_docker() {
+    local choice
+    echo
+    read -r -p "Установить Docker и Compose plugin? [Y/n]: " choice
+    case "${choice:-Y}" in
+        [nN]|[nN][oO]) INSTALL_DOCKER=false ;;
+        *) INSTALL_DOCKER=true ;;
+    esac
+}
+
 install_docker() {
-    echo "🐳 [2/5] Установка Docker..."
+    log "🐳 [2/4] Установка Docker из official repo..."
 
-    apt install -y -qq ca-certificates curl gnupg lsb-release >/dev/null
+    export DEBIAN_FRONTEND=noninteractive
 
-    echo "🔑 Добавление GPG-ключа Docker..."
+    apt-get update -qq
+    apt-get install -y -qq ca-certificates curl gnupg >/dev/null
+
+    # Удаляем конфликтующие/старые пакеты
+    apt-get remove -y docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc >/dev/null 2>&1 || true
+
     install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
 
-    CODENAME=$(lsb_release -cs 2>/dev/null || { . /etc/os-release; echo "${VERSION_CODENAME:-jammy}"; })
-    ARCH=$(dpkg --print-architecture)
-    echo "deb [arch=$ARCH signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $CODENAME stable" \
-        | tee /etc/apt/sources.list.d/docker.list >/dev/null
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
 
-    apt update -qq >/dev/null
+    cat > /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $UBUNTU_CODENAME_RESOLVED
+Components: stable
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
 
-    apt install -y -qq \
+    apt-get update -qq
+
+    apt-get install -y -qq \
         docker-ce \
         docker-ce-cli \
         containerd.io \
         docker-buildx-plugin \
-        docker-compose-plugin \
-        >/dev/null
+        docker-compose-plugin >/dev/null
 
-    docker --version >/dev/null || { echo "❌ Docker не установлен."; exit 1; }
-    docker compose version >/dev/null || { echo "❌ docker compose недоступен."; exit 1; }
-    echo "✅ Docker и docker compose установлены."
+    docker --version >/dev/null || die "Docker не установлен"
+    docker compose version >/dev/null || die "Docker Compose plugin недоступен"
+
+    # Совместимость для старых скриптов: docker-compose -> docker compose
+    cat > /usr/local/bin/docker-compose <<'EOF'
+#!/bin/sh
+exec docker compose "$@"
+EOF
+    chmod +x /usr/local/bin/docker-compose
+
+    log "✅ Docker установлен: $(docker --version)"
+    log "✅ Compose plugin установлен: $(docker compose version)"
+    log "ℹ️  /usr/local/bin/docker-compose создан как shim на 'docker compose'"
 }
 
-# ───────────────────────────────────────────────────────────────
-# Функция: совместимость `docker-compose` CLI
-# ───────────────────────────────────────────────────────────────
-setup_docker_compose_compat() {
-    echo "🔗 [3/5] Настройка 'docker-compose' совместимости..."
-
-    COMPOSE_BIN=""
-    for p in /usr/lib/docker/cli-plugins/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose; do
-        [ -x "$p" ] && COMPOSE_BIN="$p" && break
-    done
-
-    if [ -n "$COMPOSE_BIN" ]; then
-        ln -sf "$COMPOSE_BIN" /usr/local/bin/docker-compose 2>/dev/null || true
-    else
-        VER=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
-        [ -z "$VER" ] && VER="v2.29.7"
-        DOWNLOAD_URL="https://github.com/docker/compose/releases/download/$VER/docker-compose-$(uname -s)-$(uname -m)"
-        echo "📥 Загрузка standalone docker-compose: $DOWNLOAD_URL"
-        curl -SL "$DOWNLOAD_URL" -o /usr/local/bin/docker-compose
-        chmod +x /usr/local/bin/docker-compose
+maybe_configure_ufw() {
+    if ! command -v ufw >/dev/null 2>&1; then
+        return
     fi
 
-    docker-compose --version >/dev/null || { echo "❌ docker-compose не работает."; exit 1; }
-    echo "✅ docker-compose доступен."
-}
-
-# ───────────────────────────────────────────────────────────────
-# Выполнение установки Docker (если выбрано)
-# ───────────────────────────────────────────────────────────────
-if [ "$INSTALL_DOCKER" = true ]; then
-    install_docker
-    setup_docker_compose_compat
-
-    echo "👥 [4/5] Настройка прав доступа..."
-    if [ -n "$TARGET_USER" ] && id "$TARGET_USER" &>/dev/null; then
-        if ! groups "$TARGET_USER" | grep -qw docker; then
-            usermod -aG docker "$TARGET_USER"
-            echo "✅ $TARGET_USER добавлен в группу 'docker'."
-            echo "ℹ️  Примените изменения: 'newgrp docker' или перелогиньтесь."
-        else
-            echo "ℹ️  $TARGET_USER уже состоит в группе 'docker'."
-        fi
-    else
-        echo "⚠️  Не удалось определить пользователя для добавления в группу 'docker'."
+    if ! ufw status 2>/dev/null | grep -q "^Status: active"; then
+        return
     fi
-else
-    echo "⏭️  Установка Docker пропущена."
-fi
 
-# ───────────────────────────────────────────────────────────────
-# 4. Обновление системы — В САМОМ КОНЦЕ
-# ───────────────────────────────────────────────────────────────
-echo
-echo "📦 [$(($INSTALL_DOCKER ? 5 : 4))/$(($INSTALL_DOCKER ? 6 : 5))] Проверка обновлений..."
-apt update -qq >/dev/null 2>&1
-UPGRADABLE=$(apt list --upgradable 2>/dev/null | grep -v "Listing..." | wc -l)
-echo "Доступно обновлений: $UPGRADABLE"
-
-if [ "$UPGRADABLE" -gt 0 ]; then
     echo
-    read -p "Выполнить 'apt upgrade'? [Y/n]: " -r REPLY
-    case "${REPLY:-Y}" in
-        [yY]|[Yy][eE][sS]|"")
-            echo
-            read -p "Режим: (a) авто (сохранить конфиги) / (i) интерактивно? [a/i]: " -r MODE
-            case "${MODE:-a}" in
-                [iI]*)
-                    echo "🔁 Интерактивное обновление:"
-                    apt upgrade
-                    ;;
-                *)
-                    echo "⏳ Автообновление..."
-                    DEBIAN_FRONTEND=noninteractive \
-                    apt upgrade -y -qq \
-                        -o Dpkg::Options::="--force-confdef" \
-                        -o Dpkg::Options::="--force-confold"
-                    ;;
-            esac
-            echo "✅ Обновление завершено."
+    read -r -p "UFW активен. Разрешить новый SSH порт ${SSH_NEW_PORT}/tcp сейчас? [Y/n]: " reply
+    case "${reply:-Y}" in
+        [nN]|[nN][oO])
+            warn "Порт в UFW не открыт автоматически."
             ;;
         *)
-            echo "⏭️  Обновление отложено. Выполните позже: sudo apt upgrade"
+            ufw allow "${SSH_NEW_PORT}/tcp"
+            log "✅ UFW: разрешён порт ${SSH_NEW_PORT}/tcp"
             ;;
     esac
-else
-    echo "✅ Обновлять нечего."
-fi
+}
 
-# ───────────────────────────────────────────────────────────────
-# Финал
-# ───────────────────────────────────────────────────────────────
-echo
-echo "============================================"
-echo "✅ Сервер настроен!"
-echo
-echo "🔹 SSH: порт $NEW_PORT"
-if [ "$INSTALL_DOCKER" = true ]; then
-    echo "🔹 Docker: $(docker --version | cut -d' ' -f3)"
-    echo "🔹 docker-compose: $(docker-compose --version | cut -d',' -f1)"
-    [ -n "$TARGET_USER" ] && echo "🔹 Пользователь: $TARGET_USER (в группе docker)"
-fi
-echo
-echo "⚠️  Действия после скрипта:"
-echo "   1. Разрешите порт в фаерволе:"
-echo "        sudo ufw allow $NEW_PORT/tcp && sudo ufw reload"
-echo "   2. Переподключитесь: ssh -p $NEW_PORT user@host"
-[ "$INSTALL_DOCKER" = true ] && echo "   3. Проверьте Docker: docker run hello-world"
-echo "============================================"
+maybe_upgrade_system() {
+    log
+    log "📦 [3/4] Проверка обновлений..."
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq >/dev/null 2>&1
+
+    local upgradable
+    upgradable="$(apt list --upgradable 2>/dev/null | grep -vc '^Listing\.\.\.$' || true)"
+    upgradable="${upgradable:-0}"
+
+    log "Доступно обновлений: $upgradable"
+
+    if [[ "$upgradable" -le 0 ]]; then
+        log "✅ Обновлять нечего."
+        return
+    fi
+
+    echo
+    read -r -p "Выполнить apt upgrade? [Y/n]: " reply
+    case "${reply:-Y}" in
+        [nN]|[nN][oO])
+            log "⏭️  Обновление пропущено."
+            return
+            ;;
+    esac
+
+    echo
+    read -r -p "Режим: (a) авто / (i) интерактивно? [a/i]: " mode
+    case "${mode:-a}" in
+        [iI]*)
+            log "🔁 Интерактивное обновление..."
+            apt-get upgrade
+            ;;
+        *)
+            log "⏳ Автообновление..."
+            apt-get upgrade -y -qq \
+                -o Dpkg::Options::="--force-confdef" \
+                -o Dpkg::Options::="--force-confold"
+            ;;
+    esac
+
+    log "✅ Обновление завершено."
+}
+
+print_summary() {
+    log
+    log "============================================"
+    log "✅ Сервер настроен"
+    log
+    log "🔹 SSH порт: $SSH_NEW_PORT"
+
+    if has_root_authorized_keys; then
+        log "🔹 Root login: только по SSH ключу"
+    else
+        log "🔹 Root login: пароль оставлен включённым"
+    fi
+
+    if [[ "$INSTALL_DOCKER" == true ]]; then
+        log "🔹 Docker: $(docker --version | sed 's/,//g')"
+        log "🔹 Compose: $(docker compose version | head -n1)"
+    else
+        log "🔹 Docker: пропущен"
+    fi
+
+    log
+    log "⚠️  Что сделать дальше:"
+    log "   1. Переподключитесь:"
+    log "      ssh -p $SSH_NEW_PORT root@YOUR_SERVER_IP"
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+        log "   2. После успешного входа можно убрать старый 22/tcp из UFW, если он больше не нужен"
+    fi
+
+    if [[ "$INSTALL_DOCKER" == true ]]; then
+        log "   3. Проверка Docker:"
+        log "      docker run hello-world"
+    fi
+
+    log "============================================"
+}
+
+main() {
+    require_root
+    check_os
+    ensure_packages
+
+    log "🚀 Начало настройки сервера..."
+    log "ℹ️  Сценарий рассчитан на простой сервер с логином под root"
+
+    configure_ssh
+    maybe_configure_ufw
+    ask_install_docker
+
+    if [[ "$INSTALL_DOCKER" == true ]]; then
+        install_docker
+    else
+        log "⏭️  Установка Docker пропущена."
+    fi
+
+    maybe_upgrade_system
+    print_summary
+}
+
+main "$@"
